@@ -1,0 +1,235 @@
+from flask import Flask, render_template, request, session, jsonify
+import aiohttp
+import asyncio
+import random
+import logging
+from flask_caching import Cache
+import os
+import openai
+import requests
+from flask_session import Session
+
+app = Flask(__name__)
+app.secret_key = 'markke'
+cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+
+# Configure server-side session storage
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+
+TMDB_API_KEY = '348ade1c524acc390bd6386a15c6aba8'
+TMDB_ACCESS_TOKEN = 'eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiIzNDhhZGUxYzUyNGFjYzM5MGJkNjM4NmExNWM2YWJhOCIsInN1YiI6IjY2MTExZDYxNmY0M2VjMDE2M2MxMmY5YiIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.ujQqxwEZ-yBsWK_S2OrypWRQlm5wrPwmpoKlrta_WXo'
+
+# Initialize OpenAI client
+client = openai.OpenAI(api_key='sk-proj-0IButBB4crghDSMRenBtT3BlbkFJHpixJFlZ9EqkWuAt62dW')
+
+DESIRED_SERVICES = {
+    "Netflix": ["Netflix"],
+    "Disney+": ["Disney+", "Disney Plus"],
+    "Tencent Video": ["Tencent Video"],
+    "HBO Max": ["HBO Max"],
+    "Paramount+": ["Paramount+", "Paramount Plus"],
+    "Hulu": ["Hulu"],
+    "Apple TV+": ["Apple TV+", "Apple TV"],
+    "Peacock": ["Peacock"],
+    "Starz": ["Starz"],
+    "ESPN+": ["ESPN+", "ESPN Plus"]
+}
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
+async def fetch_json(session, url):
+    async with session.get(url) as response:
+        return await response.json()
+
+@cache.cached(timeout=3600, key_prefix='genres')
+def fetch_genres():
+    url = "https://api.themoviedb.org/3/genre/movie/list?language=en"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {TMDB_ACCESS_TOKEN}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json().get('genres', [])
+    return []
+
+@cache.cached(timeout=3600, key_prefix='countries')
+def fetch_countries():
+    url = "https://api.themoviedb.org/3/configuration/countries"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {TMDB_ACCESS_TOKEN}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
+@cache.cached(timeout=3600, key_prefix='streaming_services')
+def fetch_streaming_services():
+    url = "https://api.themoviedb.org/3/watch/providers/movie?language=en&watch_region=US"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {TMDB_ACCESS_TOKEN}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json().get('results', [])
+    return []
+
+@cache.cached(timeout=3600, key_prefix='languages')
+def fetch_languages():
+    url = "https://api.themoviedb.org/3/configuration/languages"
+    headers = {
+        "accept": "application/json",
+        "Authorization": f"Bearer {TMDB_ACCESS_TOKEN}"
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        languages = sorted(response.json(), key=lambda x: x['english_name'])
+        logger.debug("Fetched and sorted languages: %s", languages)  # Debug statement
+        return languages
+    return []
+
+def generate_emotion_description(movie_title):
+    prompt = f"describe the emotions a viewer would feel while watching the movie '{movie_title}' in 30 words or less use powerful emotive language. ."
+    try:
+        response = client.completions.create(
+            model="gpt-3.5-turbo-instruct",
+            prompt=prompt,
+            max_tokens=150
+        )
+        return response.choices[0].text.strip()
+    except Exception as err:
+        logger.error(f"Error generating emotion description: {err}")
+        return "Unable to generate emotion description at this time."
+
+async def fetch_movie_providers(session, movie_id, country):
+    url = f'https://api.themoviedb.org/3/movie/{movie_id}/watch/providers?api_key={TMDB_API_KEY}'
+    response = await fetch_json(session, url)
+    return response.get('results', {}).get(country, {}).get('flatrate', [])
+
+async def fetch_movies(session, country, services, genres, language, page):
+    service_ids = ','.join(services)
+    genre_ids = ','.join(genres)
+    url = f'https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&region={country}&with_watch_providers={service_ids}&watch_region={country}&page={page}'
+    if genre_ids:
+        url += f'&with_genres={genre_ids}'
+    if language and language != 'any':
+        url += f'&with_original_language={language}'
+    
+    response = await fetch_json(session, url)
+    movies = response.get('results', [])
+    for movie in movies:
+        movie['providers'] = await fetch_movie_providers(session, movie['id'], country)
+    return movies
+
+async def get_total_pages(session, country, services, genres, language):
+    service_ids = ','.join(services)
+    genre_ids = ','.join(genres)
+    url = f'https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&region={country}&with_watch_providers={service_ids}&watch_region={country}'
+    if genre_ids:
+        url += f'&with_genres={genre_ids}'
+    if language and language != 'any':
+        url += f'&with_original_language={language}'
+
+    response = await fetch_json(session, url)
+    return response.get('total_pages', 1)
+
+@app.route('/')
+def home():
+    return render_template('home.html')
+
+@app.route('/start')
+def start():
+    if 'genres' not in session:
+        session['genres'] = fetch_genres()
+    if 'countries' not in session:
+        session['countries'] = sorted(fetch_countries(), key=lambda x: x['english_name'])
+    if 'streaming_services' not in session:
+        session['streaming_services'] = sorted(fetch_streaming_services(), key=lambda x: x['provider_name'])
+    if 'languages' not in session:
+        session['languages'] = fetch_languages()
+    
+    filtered_services = [service for service in session['streaming_services'] 
+                         if any(service['provider_name'] in names for names in DESIRED_SERVICES.values())]
+
+    selected_country = session.get('country', '')
+    selected_language = session.get('language', '')
+    selected_services = session.get('selected_services', [])
+    selected_genres = session.get('selected_genres', [])
+
+    return render_template('index.html', genres=session['genres'], countries=session['countries'], 
+                           streaming_services=filtered_services, languages=session['languages'], 
+                           selected_country=selected_country, selected_language=selected_language, 
+                           selected_services=selected_services, selected_genres=selected_genres)
+
+@app.route('/pick', methods=['POST'])
+def pick():
+    data = request.get_json()
+    country = data.get('country')
+    services = data.get('services')
+    genres = data.get('genres')
+    language = data.get('language')
+
+    session['country'] = country
+    session['language'] = language
+    session['selected_services'] = services
+    session['selected_genres'] = genres
+
+    async def get_movies():
+        async with aiohttp.ClientSession() as session:
+            tasks = []
+            for service in services:
+                tasks.append(fetch_movies_for_service(session, country, service, genres, language))
+            results = await asyncio.gather(*tasks)
+        selected_movies = [movie for result in results for movie in result]
+        return selected_movies
+
+    async def fetch_movies_for_service(session, country, service, genres, language):
+        total_pages = await get_total_pages(session, country, [service], genres, language)
+        if total_pages > 0:
+            random_page = random.randint(1, total_pages)
+            service_movies = await fetch_movies(session, country, [service], genres, language, random_page)
+            logger.debug(f"Movies fetched for service {service} on page {random_page}: {len(service_movies)} movies")
+            if service_movies:
+                return [random.choice(service_movies)]
+        return []
+
+    selected_movies = asyncio.run(get_movies())
+
+    logger.debug(f"Selected movies: {selected_movies}")
+
+    if len(selected_movies) == 1:
+        selected_movie = selected_movies[0]
+    else:
+        selected_movie = max(selected_movies, key=lambda x: x['vote_average']) if selected_movies else None
+
+    if selected_movie:
+        provider_id = selected_movie['providers'][0]['provider_id'] if selected_movie['providers'] else None
+        emotion_description = generate_emotion_description(selected_movie['title'])
+        
+        logger.debug(f"Selected movie: {selected_movie}")
+        logger.debug(f"Genres: {genres}")
+        logger.debug(f"Services: {services}")
+        logger.debug(f"Country: {country}")
+        logger.debug(f"Language: {language}")
+
+        return jsonify(
+            provider_id=provider_id,
+            emotion_description=emotion_description,
+            html=render_template('result.html', movie=selected_movie, genres=genres, services=services, country=country, language=language, emotion_description=emotion_description)
+        )
+    
+    return jsonify(
+        provider_id=None,
+        emotion_description=None,
+        html=render_template('result.html', movie=None, genres=genres, services=services, country=country, language=language)
+    )
+
+if __name__ == '__main__':
+    app.run(debug=True)
+
